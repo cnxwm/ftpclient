@@ -289,9 +289,20 @@ bool MainWindow::listDirectory(const QString &path)
         normalizedPath += "/";
     }
     
-    QString fullUrl = server + normalizedPath;
-    appendLog(QString("URL: %1").arg(fullUrl));
-
+    // 对URL进行编码处理，特别是处理路径中的非ASCII字符（如中文）和特殊字符
+    QByteArray pathUtf8 = normalizedPath.toUtf8();
+    char *escapedPath = curl_easy_escape(curl, pathUtf8.constData(), pathUtf8.length());
+    
+    // 替换掉编码后的斜杠，因为我们需要保留路径结构
+    QString encodedPath = QString(escapedPath);
+    encodedPath.replace("%2F", "/"); // 把转义的斜杠替换回来，保留路径结构
+    
+    QString fullUrl = server + encodedPath;
+    appendLog(QString("编码后的目录URL: %1").arg(fullUrl));
+    
+    // 释放CURL分配的内存
+    curl_free(escapedPath);
+    
     // 设置CURL选项
     curl_easy_setopt(curl, CURLOPT_URL, fullUrl.toUtf8().constData());
     curl_easy_setopt(curl, CURLOPT_USERNAME, ui->usernameEdit->text().toUtf8().constData());
@@ -757,7 +768,19 @@ bool MainWindow::downloadFile(const QString &remotePath, const QString &localPat
         normalizedPath = "/" + normalizedPath;
     }
     
-    QString fullUrl = server + normalizedPath;
+    // 对URL进行编码处理，特别是处理文件名中的非ASCII字符（如中文）和特殊字符
+    QByteArray pathUtf8 = normalizedPath.toUtf8();
+    char *escapedPath = curl_easy_escape(curl, pathUtf8.constData(), pathUtf8.length());
+    
+    // 替换掉编码后的斜杠，因为我们需要保留路径结构
+    QString encodedPath = QString(escapedPath);
+    encodedPath.replace("%2F", "/"); // 把转义的斜杠替换回来，保留路径结构
+    
+    QString fullUrl = server + encodedPath;
+    appendLog(QString("编码后的URL: %1").arg(fullUrl));
+    
+    // 释放CURL分配的内存
+    curl_free(escapedPath);
     
     // 设置CURL选项
     CURL *downloadHandle = curl_easy_init();
@@ -842,7 +865,19 @@ bool MainWindow::listDirectoryForDownload(const QString &path, const QString &ta
         normalizedPath += "/";
     }
     
-    QString fullUrl = server + normalizedPath;
+    // 对URL进行编码处理，特别是处理路径中的非ASCII字符（如中文）和特殊字符
+    QByteArray pathUtf8 = normalizedPath.toUtf8();
+    char *escapedPath = curl_easy_escape(curl, pathUtf8.constData(), pathUtf8.length());
+    
+    // 替换掉编码后的斜杠，因为我们需要保留路径结构
+    QString encodedPath = QString(escapedPath);
+    encodedPath.replace("%2F", "/"); // 把转义的斜杠替换回来，保留路径结构
+    
+    QString fullUrl = server + encodedPath;
+    appendLog(QString("编码后的目录URL: %1").arg(fullUrl));
+    
+    // 释放CURL分配的内存
+    curl_free(escapedPath);
     
     // 设置CURL选项
     CURL *listHandle = curl_easy_init();
