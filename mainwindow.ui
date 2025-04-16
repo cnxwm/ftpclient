@@ -47,7 +47,7 @@
          <number>65535</number>
         </property>
         <property name="value">
-         <number>21</number>
+         <number>2121</number>
         </property>
        </widget>
       </item>
@@ -75,7 +75,7 @@
       <item>
        <widget class="QLineEdit" name="passwordEdit">
         <property name="echoMode">
-         <enum>QLineEdit::Password</enum>
+         <enum>QLineEdit::EchoMode::Password</enum>
         </property>
         <property name="placeholderText">
          <string>Enter password</string>
@@ -135,7 +135,7 @@
         <item>
          <spacer name="verticalSpacer">
           <property name="orientation">
-           <enum>Qt::Vertical</enum>
+           <enum>Qt::Orientation::Vertical</enum>
           </property>
           <property name="sizeHint" stdset="0">
            <size>

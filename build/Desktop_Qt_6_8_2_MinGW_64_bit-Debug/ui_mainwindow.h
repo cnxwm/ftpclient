@@ -84,7 +84,7 @@ public:
         portSpinBox->setObjectName("portSpinBox");
         portSpinBox->setMinimum(1);
         portSpinBox->setMaximum(65535);
-        portSpinBox->setValue(21);
+        portSpinBox->setValue(2121);
 
         horizontalLayout->addWidget(portSpinBox);
 
@@ -105,7 +105,7 @@ public:
 
         passwordEdit = new QLineEdit(centralwidget);
         passwordEdit->setObjectName("passwordEdit");
-        passwordEdit->setEchoMode(QLineEdit::Password);
+        passwordEdit->setEchoMode(QLineEdit::EchoMode::Password);
 
         horizontalLayout->addWidget(passwordEdit);
 

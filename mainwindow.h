@@ -12,6 +12,7 @@
 #include <QFile>
 #include <curl/curl.h>
 #include <QStandardItemModel>
+#include <QStack>
 
 QT_BEGIN_NAMESPACE
 namespace Ui {
@@ -55,6 +56,16 @@ private slots:
      * @param index 被点击的项目索引
      */
     void onFileTreeViewDoubleClicked(const QModelIndex &index);
+    
+    /**
+     * @brief 返回上级目录按钮点击事件处理
+     */
+    void onBackButtonClicked();
+    
+    /**
+     * @brief 刷新目录按钮点击事件处理
+     */
+    void onRefreshButtonClicked();
 
 private:
     /**
@@ -94,6 +105,18 @@ private:
     void appendLog(const QString &message);
     
     /**
+     * @brief 更新当前路径显示
+     */
+    void updatePathDisplay();
+    
+    /**
+     * @brief 获取上级目录路径
+     * @param path 当前路径
+     * @return 上级目录路径
+     */
+    QString getParentDirectory(const QString &path);
+    
+    /**
      * @brief CURL写入回调函数
      * @param contents 接收到的数据
      * @param size 数据块大小
@@ -110,5 +133,6 @@ private:
     QString currentPath;                  ///< 当前目录路径
     QStringList listBuffer;               ///< 目录列表缓冲区
     bool isConnected;                     ///< 连接状态标志
+    QStack<QString> directoryHistory;     ///< 目录浏览历史
 };
 #endif // MAINWINDOW_H
