@@ -508,6 +508,30 @@ void MainWindow::parseFtpList(const QString &listData)
     appendLog(QString("已加载 %1 个项目").arg(fileModel->rowCount()));
 }
 
+void MainWindow::addDownloadTask(const QString &remotePath, const QString &localPath, 
+                               bool isDirectory, const QString &displayName, qint64 fileSize)
+{
+    QMutexLocker locker(&downloadMutex);
+    
+    DownloadTask task;
+    task.remotePath = remotePath;
+    task.localPath = localPath;
+    task.isDirectory = isDirectory;
+    task.fileSize = fileSize;
+    
+    // 如果没有提供显示名称，从路径中提取
+    if (displayName.isEmpty()) {
+        QFileInfo fileInfo(remotePath);
+        task.displayName = fileInfo.fileName();
+    } else {
+        task.displayName = displayName;
+    }
+    
+    downloadQueue.enqueue(task);
+    
+    appendLog(QString("添加%1任务: %2").arg(isDirectory ? "目录" : "文件").arg(task.displayName));
+}
+
 /**
  * @brief 文件树视图双击事件处理函数
  * @param index 被双击的项目索引
@@ -654,11 +678,8 @@ void MainWindow::appendLog(const QString &message)
 /**
  * @brief 下载按钮点击事件处理函数
  * 
- * 当用户点击下载按钮时执行，负责:
- * 1. 获取选中的文件/目录
- * 2. 让用户选择本地保存位置
- * 3. 添加下载任务到队列
- * 4. 启动下载流程
+ * 当用户点击下载按钮时，开始下载选中的文件或目录
+ * 对于文件夹，先创建目录结构，再添加文件到下载队列
  */
 void MainWindow::onDownloadButtonClicked()
 {
@@ -759,7 +780,12 @@ void MainWindow::onDownloadButtonClicked()
         }
         // 下载整个目录及其内容
         directoryTaskCount = 0;  // 重置目录任务计数
-        downloadDirectory(remotePath, localPath);  // 递归下载目录
+        
+        // 修改：这里下载目录不再添加目录任务到队列
+        if (!downloadDirectory(remotePath, localPath)) {
+            appendLog("下载目录结构失败");
+            return;
+        }
     } else {
         // 如果是文件，直接添加下载任务
         qint64 fileSize = size.toLongLong();  // 获取文件大小
@@ -776,9 +802,8 @@ void MainWindow::onDownloadButtonClicked()
 /**
  * @brief 处理下载队列中的下一个任务
  * 
- * 从下载队列中取出一个任务进行处理
- * 如果是目录，创建目录结构
- * 如果是文件，下载文件内容
+ * 从下载队列中取出一个文件任务进行处理
+ * 由于目录已在开始时创建完成，队列中只包含文件任务
  */
 void MainWindow::processNextDownloadTask()
 {
@@ -806,16 +831,8 @@ void MainWindow::processNextDownloadTask()
         progressDialog->setLabelText(QString("正在下载: %1").arg(task.displayName));
     }
     
-    // 根据任务类型处理
-    if (task.isDirectory) {
-        // 如果是目录任务，创建本地目录
-        createLocalDirectory(task.localPath);
-        // 目录创建后立即处理下一个任务，不需要等待
-        QTimer::singleShot(0, this, &MainWindow::processNextDownloadTask);
-    } else {
-        // 如果是文件任务，下载文件内容
-        downloadFile(task.remotePath, task.localPath);
-    }
+    // 直接下载文件（所有任务都是文件任务）
+    downloadFile(task.remotePath, task.localPath);
 }
 
 /**
@@ -879,10 +896,20 @@ bool MainWindow::downloadFile(const QString &remotePath, const QString &localPat
     
     appendLog(QString("下载文件: %1 -> %2").arg(remotePath).arg(localPath));
     
+    // 确保本地目录存在
+    QFileInfo fileInfo(localPath);
+    QDir dir = fileInfo.dir();
+    if (!dir.exists()) {
+        if (!dir.mkpath(".")) {
+            appendLog(QString("无法创建本地目录: %1").arg(dir.path()));
+            return false;
+        }
+    }
+    
     // 创建并打开本地文件，准备写入数据
     currentDownloadFile = new QFile(localPath);
     if (!currentDownloadFile->open(QIODevice::WriteOnly)) {
-        appendLog(QString("无法创建本地文件: %1").arg(localPath));
+        appendLog(QString("无法创建本地文件: %1，错误: %2").arg(localPath).arg(currentDownloadFile->errorString()));
         delete currentDownloadFile;
         currentDownloadFile = nullptr;
         return false;  // 无法创建本地文件
@@ -942,6 +969,7 @@ bool MainWindow::downloadFile(const QString &remotePath, const QString &localPat
     curl_easy_setopt(downloadHandle, CURLOPT_VERBOSE, 1L);                        // 启用详细输出，便于调试
     
     // 执行下载
+    appendLog(QString("开始下载文件: %1").arg(remotePath));
     CURLcode res = curl_easy_perform(downloadHandle);  // 执行CURL请求
     
     // 关闭文件和清理资源
@@ -960,7 +988,7 @@ bool MainWindow::downloadFile(const QString &remotePath, const QString &localPat
     }
     
     // 下载成功
-    appendLog(QString("下载完成: %1").arg(localPath));
+    appendLog(QString("下载完成: %1 (总共接收 %2 字节)").arg(localPath).arg(totalBytesReceived));
     
     // 处理下一个任务
     QTimer::singleShot(0, this, &MainWindow::processNextDownloadTask);
@@ -991,7 +1019,9 @@ size_t MainWindow::DownloadCallback(void *contents, size_t size, size_t nmemb, v
         
         // 更新下载进度
         window->totalBytesReceived += written;  // 累加已接收字节数
-        window->updateDownloadProgress(window->totalBytesReceived, window->currentDownloadFile->size());
+        
+        // 使用任务的文件大小或已接收大小，而不是currentDownloadFile->size()
+        window->updateDownloadProgress(window->totalBytesReceived, window->totalBytesReceived);
         
         return written;  // 返回实际写入的字节数
     }
@@ -999,22 +1029,36 @@ size_t MainWindow::DownloadCallback(void *contents, size_t size, size_t nmemb, v
     return 0;  // 无法写入，返回0
 }
 
+/**
+ * @brief 下载目录
+ * @param remotePath 远程目录路径
+ * @param localPath 本地保存路径
+ * @return 是否操作成功
+ * 
+ * 下载整个目录结构，先创建所有文件夹结构，再添加文件到下载队列
+ */
 bool MainWindow::downloadDirectory(const QString &remotePath, const QString &localPath)
 {
     appendLog(QString("下载目录: %1 -> %2").arg(remotePath).arg(localPath));
     
-    // 添加目录任务，用于创建目录结构
-    addDownloadTask(remotePath, localPath, true);
+    // 不再添加目录任务到队列，而是直接创建本地目录
+    if (!createLocalDirectory(localPath)) {
+        appendLog(QString("无法创建本地目录: %1").arg(localPath));
+        return false;
+    }
     
-    directoryTaskCount++; // 增加目录计数
+    directoryTaskCount++; // 增加目录计数，用于跟踪递归处理进度
     
-    // 列出目录内容并添加到下载队列
+    // 列出目录内容并创建目录结构、添加文件到下载队列
     return listDirectoryForDownload(remotePath, localPath);
 }
 
 bool MainWindow::listDirectoryForDownload(const QString &path, const QString &targetDir)
 {
     if (!curl || !isConnected) return false;
+    
+    // 添加详细日志，显示正在处理的路径
+    appendLog(QString("处理目录内容: %1 -> %2").arg(path).arg(targetDir));
     
     // 清空列表缓冲区
     listBuffer.clear();
@@ -1080,14 +1124,25 @@ bool MainWindow::listDirectoryForDownload(const QString &path, const QString &ta
         return false;
     }
     
-    // 解析目录列表并添加到下载队列
+    // 显示获取到的原始数据长度，用于调试
     QString listData = listBuffer.join("\n");
+    appendLog(QString("获取到目录数据长度: %1 字节").arg(listData.length()));
+    
     QStringList lines = listData.split("\n", Qt::SkipEmptyParts);
+    appendLog(QString("解析到 %1 行内容").arg(lines.count()));
     
     // 使用与parseFtpList相似的正则表达式解析文件列表
     QRegularExpression unixRe("([d-])([rwx-]{9})\\s+(\\d+)\\s+(\\w+)\\s+(\\w+)\\s+(\\d+)\\s+(\\w+\\s+\\d+\\s+[\\d:]+)\\s+(.+)");
     QRegularExpression windowsRe("(\\d{2}-\\d{2}-\\d{2})\\s+(\\d{2}:\\d{2}[AP]M)\\s+(<DIR>|\\d+)\\s+(.+)");
     QRegularExpression simpleRe("([d-])[^\\s]+\\s+.*\\s+(.+)$");
+    
+    // 存储该目录中的所有子目录和文件信息
+    QList<QString> subDirs;
+    QList<QPair<QString, qint64>> files;
+    
+    // 收集目录和文件的计数，用于调试
+    int dirCount = 0;
+    int fileCount = 0;
     
     for (const QString &line : lines) {
         bool isDir = false;
@@ -1172,46 +1227,72 @@ bool MainWindow::listDirectoryForDownload(const QString &path, const QString &ta
         QString itemLocalPath = targetDir + "/" + name;
         
         if (isDir) {
-            // 递归添加目录任务
-            directoryTaskCount++; // 增加目录计数
-            createLocalDirectory(itemLocalPath);
-            addDownloadTask(itemRemotePath, itemLocalPath, true, name);
-            
-            // 递归处理子目录
-            listDirectoryForDownload(itemRemotePath, itemLocalPath);
+            // 不添加目录任务，而是收集子目录信息，稍后处理
+            // 使用特殊分隔符 "||" 代替 ":" 来避免与路径中的冒号冲突
+            subDirs.append(itemRemotePath + "||" + itemLocalPath);
+            dirCount++;
+            // 添加日志显示找到的目录
+            appendLog(QString("发现子目录: %1").arg(name));
         } else {
-            // 添加文件下载任务
-            addDownloadTask(itemRemotePath, itemLocalPath, false, name, fileSize);
+            // 收集文件信息，稍后添加到下载队列
+            // 使用特殊分隔符 "||" 代替 ":" 来避免与路径中的冒号冲突
+            files.append(qMakePair(itemRemotePath + "||" + itemLocalPath + "||" + name, fileSize));
+            fileCount++;
+            // 添加日志显示找到的文件
+            appendLog(QString("发现文件: %1 (大小: %2 字节)").arg(name).arg(fileSize));
         }
     }
+    
+    // 添加统计信息日志
+    appendLog(QString("目录 %1 中: 发现 %2 个子目录, %3 个文件").arg(path).arg(dirCount).arg(fileCount));
+    
+    // 先处理所有子目录，创建完整的目录结构
+    for (const QString &dirInfo : subDirs) {
+        QStringList parts = dirInfo.split("||");
+        if (parts.size() < 2) {
+            appendLog(QString("错误的目录信息格式: %1").arg(dirInfo));
+            continue;
+        }
+        
+        QString remoteSubDir = parts[0];
+        QString localSubDir = parts[1];
+        
+        // 创建本地子目录
+        createLocalDirectory(localSubDir);
+        
+        // 递归处理子目录，继续创建结构
+        directoryTaskCount++; // 增加目录计数
+        listDirectoryForDownload(remoteSubDir, localSubDir);
+    }
+    
+    // 处理完所有子目录后，再添加文件到下载队列
+    int addedFiles = 0;
+    for (const QPair<QString, qint64> &fileInfo : files) {
+        QStringList parts = fileInfo.first.split("||");
+        if (parts.size() < 3) {
+            appendLog(QString("错误的文件信息格式: %1").arg(fileInfo.first));
+            continue;
+        }
+        
+        QString remoteFilePath = parts[0];
+        QString localFilePath = parts[1];
+        QString displayName = parts[2];
+        qint64 fileSize = fileInfo.second;
+        
+        // 添加日志显示添加的文件任务
+        appendLog(QString("添加文件下载任务: %1 -> %2 (大小: %3 字节)").arg(remoteFilePath).arg(localFilePath).arg(fileSize));
+        
+        // 添加文件下载任务
+        addDownloadTask(remoteFilePath, localFilePath, false, displayName, fileSize);
+        addedFiles++;
+    }
+    
+    // 添加文件统计日志
+    appendLog(QString("已添加 %1 个文件到下载队列").arg(addedFiles));
     
     // 减少目录计数
     directoryTaskCount--;
     appendLog(QString("剩余目录任务: %1").arg(directoryTaskCount));
     
     return true;
-}
-
-void MainWindow::addDownloadTask(const QString &remotePath, const QString &localPath, 
-                               bool isDirectory, const QString &displayName, qint64 fileSize)
-{
-    QMutexLocker locker(&downloadMutex);
-    
-    DownloadTask task;
-    task.remotePath = remotePath;
-    task.localPath = localPath;
-    task.isDirectory = isDirectory;
-    task.fileSize = fileSize;
-    
-    // 如果没有提供显示名称，从路径中提取
-    if (displayName.isEmpty()) {
-        QFileInfo fileInfo(remotePath);
-        task.displayName = fileInfo.fileName();
-    } else {
-        task.displayName = displayName;
-    }
-    
-    downloadQueue.enqueue(task);
-    
-    appendLog(QString("添加%1任务: %2").arg(isDirectory ? "目录" : "文件").arg(task.displayName));
 }
