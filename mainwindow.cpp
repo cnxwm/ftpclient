@@ -3,7 +3,7 @@
  * @brief FTP客户端主窗口实现文件
  * 
  * 本文件实现了FTP客户端的核心功能，包括界面初始化、FTP连接、
- * 目录浏览、文件下载等。使用libcurl库作为底层FTP协议实现。
+ * 目录浏览、文件下载等。使用FtpClient类作为底层FTP协议实现。
  */
 
 #include "mainwindow.h"
@@ -29,29 +29,17 @@
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
-    , curl(nullptr)           // CURL句柄初始化为空
-    , headers(nullptr)        // CURL头部列表初始化为空
+    , ftpClient(new FtpClient())      // 创建FTP客户端对象
     , fileModel(new QStandardItemModel(this))  // 创建文件列表模型
-    , currentPath("/")        // 初始化当前路径为根目录
-    , isConnected(false)      // 初始连接状态为未连接
-    , isDownloading(false)    // 初始下载状态为未下载
-    , currentDownloadFile(nullptr)  // 当前下载文件初始为空
-    , totalBytesReceived(0)   // 初始已接收字节数为0
-    , progressDialog(nullptr)  // 初始进度对话框为空
-    , directoryTaskCount(0)   // 初始目录任务计数为0
+    , currentPath("/")                // 初始化当前路径为根目录
+    , isConnected(false)              // 初始连接状态为未连接
+    , isDownloading(false)            // 初始下载状态为未下载
+    , progressDialog(nullptr)         // 初始进度对话框为空
+    , directoryTaskCount(0)           // 初始目录任务计数为0
     , downloadQueue(QQueue<DownloadTask>())  // 初始化下载队列
-    , downloadMutex(QMutex())  // 初始化互斥锁
+    , downloadMutex(QMutex())         // 初始化互斥锁
 {
     ui->setupUi(this);  // 设置UI，加载由Qt Designer生成的界面
-
-    // 初始化 libcurl 全局环境
-    // CURL_GLOBAL_ALL表示初始化所有可能的子系统
-    curl_global_init(CURL_GLOBAL_ALL);
-    curl = curl_easy_init();  // 初始化一个CURL句柄
-    if (!curl) {
-        appendLog("Failed to initialize CURL");  // 如果初始化失败，记录日志
-        return;
-    }
 
     // 设置文件树视图的模型
     // 设置表头标题，用于显示文件名、大小、类型和日期
@@ -123,17 +111,11 @@ MainWindow::MainWindow(QWidget *parent)
 /**
  * @brief 析构函数，释放资源
  * 
- * 清理下载相关资源，关闭打开的文件，释放CURL资源
+ * 清理下载相关资源，关闭打开的文件，释放资源
  */
 MainWindow::~MainWindow()
 {
     // 清理下载相关资源
-    if (currentDownloadFile) {
-        currentDownloadFile->close();  // 关闭当前下载文件
-        delete currentDownloadFile;    // 释放文件对象
-        currentDownloadFile = nullptr;
-    }
-    
     if (progressDialog) {
         progressDialog->close();       // 关闭进度对话框
         delete progressDialog;         // 释放对话框对象
@@ -145,13 +127,7 @@ MainWindow::~MainWindow()
     }
 
     delete ui;                         // 释放UI资源
-    if (headers) {
-        curl_slist_free_all(headers);  // 释放CURL头部列表
-    }
-    if (curl) {
-        curl_easy_cleanup(curl);       // 清理CURL句柄
-    }
-    curl_global_cleanup();             // 清理CURL全局环境
+    delete ftpClient;                  // 释放FTP客户端对象
 }
 
 /**
@@ -161,14 +137,27 @@ MainWindow::~MainWindow()
  */
 void MainWindow::onConnectButtonClicked()
 {
-    // 调用connectToFtp函数尝试连接FTP服务器
-    if (connectToFtp()) {
+    QString server = ui->serverEdit->text();
+    int port = ui->portSpinBox->value();
+    QString username = ui->usernameEdit->text();
+    QString password = ui->passwordEdit->text();
+    
+    if (server.isEmpty()) {
+        appendLog("请输入FTP服务器地址");
+        return;
+    }
+    
+    // 调用FtpClient连接FTP服务器
+    if (ftpClient->connect(server, port, username, password)) {
         isConnected = true;                  // 设置连接标志为true
         updateButtonStates(true);            // 更新按钮状态为已连接
         appendLog("连接成功！");              // 添加成功日志
         currentPath = "/";                   // 设置当前路径为根目录
         directoryHistory.clear();            // 清空目录历史记录
         listDirectory(currentPath);          // 列出根目录内容
+    } else {
+        // 连接失败，显示错误信息
+        appendLog(QString("连接失败: %1").arg(ftpClient->lastError()));
     }
 }
 
@@ -179,26 +168,31 @@ void MainWindow::onConnectButtonClicked()
  */
 void MainWindow::onDisconnectButtonClicked()
 {
-    disconnectFromFtp();                     // 调用断开连接函数
+    ftpClient->disconnect();                 // 调用断开连接函数
     isConnected = false;                     // 设置连接标志为false
-    disconnectFromFtp();
-    isConnected = false;
-    updateButtonStates(false);
-    appendLog("已断开连接");
-    currentPath = "/";
-    directoryHistory.clear();
-    fileModel->removeRows(0, fileModel->rowCount());
-    updatePathDisplay();
+    updateButtonStates(false);               // 更新按钮状态为未连接
+    appendLog("已断开连接");                  // 添加断开连接日志
+    currentPath = "/";                       // 重置当前路径
+    directoryHistory.clear();                // 清空目录历史记录
+    fileModel->removeRows(0, fileModel->rowCount()); // 清空文件列表
+    updatePathDisplay();                     // 更新路径显示
 }
 
 void MainWindow::onBackButtonClicked()
 {
     if (!isConnected) return;
     
-    QString parentDir = getParentDirectory(currentPath);
-    if (parentDir != currentPath) {
-        // 如果不是根目录，则导航到上级目录
-        listDirectory(parentDir);
+    if (!directoryHistory.isEmpty()) {
+        // 从历史记录中获取上一级目录
+        QString prevPath = directoryHistory.pop();
+        listDirectory(prevPath);
+    } else {
+        // 如果历史记录为空，尝试计算上级目录
+        QString parentDir = ftpClient->getParentDirectory(currentPath);
+        if (parentDir != currentPath) {
+            // 如果不是根目录，则导航到上级目录
+            listDirectory(parentDir);
+        }
     }
 }
 
@@ -209,34 +203,11 @@ void MainWindow::onRefreshButtonClicked()
     }
 }
 
-QString MainWindow::getParentDirectory(const QString &path)
-{
-    if (path == "/" || path.isEmpty()) {
-        return "/";
-    }
-    
-    QString workPath = path;
-    // 如果路径已经以/结尾，先去掉它再处理
-    if (workPath.endsWith('/')) {
-        workPath.chop(1);
-    }
-    
-    int lastSlash = workPath.lastIndexOf('/');
-    if (lastSlash == 0) {
-        // 如果是根目录下的文件夹，返回根目录
-        return "/";
-    } else if (lastSlash > 0) {
-        // 返回上级目录，确保以/结尾
-        QString parentDir = workPath.left(lastSlash);
-        if (!parentDir.endsWith('/')) {
-            parentDir += '/';
-        }
-        return parentDir;
-    }
-    
-    return "/";
-}
-
+/**
+ * @brief 更新路径显示
+ * 
+ * 在路径编辑框中显示当前FTP目录路径
+ */
 void MainWindow::updatePathDisplay()
 {
     QLineEdit* pathEdit = this->findChild<QLineEdit*>("pathEdit");
@@ -245,44 +216,108 @@ void MainWindow::updatePathDisplay()
     }
 }
 
-bool MainWindow::connectToFtp()
+/**
+ * @brief 添加日志信息
+ * @param message 日志消息
+ * 
+ * 在日志文本框中添加一条带时间戳的日志信息
+ */
+void MainWindow::appendLog(const QString &message)
 {
-    QString server = ui->serverEdit->text();
-    if (server.isEmpty()) {
-        appendLog("请输入FTP服务器地址");
-        return false;
-    }
-
-    // 构建FTP URL
-    QString ftpUrl = server;
-    if (!ftpUrl.startsWith("ftp://")) {
-        ftpUrl = "ftp://" + ftpUrl;
-    }
-
-    // 设置CURL选项
-    curl_easy_setopt(curl, CURLOPT_URL, ftpUrl.toUtf8().constData());
-    curl_easy_setopt(curl, CURLOPT_PORT, ui->portSpinBox->value());
-    curl_easy_setopt(curl, CURLOPT_USERNAME, ui->usernameEdit->text().toUtf8().constData());
-    curl_easy_setopt(curl, CURLOPT_PASSWORD, ui->passwordEdit->text().toUtf8().constData());
-    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, this);
-
-    // 执行连接测试
-    CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        appendLog(QString("连接失败: %1").arg(curl_easy_strerror(res)));
-        return false;
-    }
-
-    return true;
+    QString timeStr = QTime::currentTime().toString("hh:mm:ss");
+    ui->logTextEdit->appendPlainText(QString("[%1] %2").arg(timeStr).arg(message));
 }
 
-void MainWindow::disconnectFromFtp()
+/**
+ * @brief 更新按钮状态
+ * @param connected 是否已连接
+ * 
+ * 根据当前连接状态更新UI上各个按钮的启用/禁用状态
+ */
+void MainWindow::updateButtonStates(bool connected)
 {
-    if (curl) {
-        curl_easy_cleanup(curl);
-        curl = curl_easy_init();
+    // 连接按钮和断开连接按钮的状态相反
+    ui->connectButton->setEnabled(!connected);
+    ui->disconnectButton->setEnabled(connected);
+    
+    // 连接时启用服务器设置控件，断开时禁用
+    ui->serverEdit->setEnabled(!connected);
+    ui->portSpinBox->setEnabled(!connected);
+    ui->usernameEdit->setEnabled(!connected);
+    ui->passwordEdit->setEnabled(!connected);
+    
+    // 浏览和下载相关按钮仅在连接后启用
+    ui->downloadButton->setEnabled(connected);
+    
+    // 查找返回上级和刷新按钮并设置状态
+    QPushButton* backButton = this->findChild<QPushButton*>("backButton");
+    QPushButton* refreshButton = this->findChild<QPushButton*>("refreshButton");
+    
+    if (backButton) {
+        backButton->setEnabled(connected);
+    }
+    
+    if (refreshButton) {
+        refreshButton->setEnabled(connected);
+    }
+}
+
+/**
+ * @brief 文件树视图双击事件处理
+ * @param index 被点击的项目索引
+ */
+void MainWindow::onFileTreeViewDoubleClicked(const QModelIndex &index)
+{
+    if (!isConnected) return;
+    
+    // 获取点击的项目
+    QStandardItem* item = fileModel->itemFromIndex(index);
+    if (!item) return;
+    
+    // 获取名称列的项目（第一列）
+    QStandardItem* nameItem = fileModel->item(item->row(), 0);
+    if (!nameItem) return;
+    
+    QString name = nameItem->text();
+    
+    // 获取类型列的项目（第三列）
+    QStandardItem* typeItem = fileModel->item(item->row(), 2);
+    if (!typeItem) return;
+    
+    QString type = typeItem->text();
+    
+    // 如果是目录，则进入该目录
+    if (type == "Directory" || name == "..") {
+        QString newPath;
+        
+        if (name == "..") {
+            // 返回上级目录
+            if (!directoryHistory.isEmpty()) {
+                newPath = directoryHistory.pop();
+            } else {
+                newPath = ftpClient->getParentDirectory(currentPath);
+            }
+        } else {
+            // 进入子目录
+            if (currentPath.endsWith("/")) {
+                newPath = currentPath + name;
+            } else {
+                newPath = currentPath + "/" + name;
+            }
+        }
+        
+        // 列出新目录的内容
+        listDirectory(newPath);
+    } else {
+        // 如果是文件，显示文件信息
+        QStandardItem* sizeItem = fileModel->item(item->row(), 1);
+        QString size = sizeItem ? sizeItem->text() : "未知大小";
+        
+        QStandardItem* dateItem = fileModel->item(item->row(), 3);
+        QString date = dateItem ? dateItem->text() : "未知日期";
+        
+        QString info = QString("文件: %1\n大小: %2\n日期: %3").arg(name).arg(size).arg(date);
+        appendLog(info);
     }
 }
 
@@ -290,84 +325,33 @@ void MainWindow::disconnectFromFtp()
  * @brief 列出目录内容
  * @param path 要列出的目录路径
  * @return 操作是否成功
- * 
- * 获取指定FTP目录的内容，并在文件树视图中显示
  */
 bool MainWindow::listDirectory(const QString &path)
 {
-    if (!curl || !isConnected) return false;  // 如果未连接或CURL句柄为空，返回失败
+    if (!isConnected) return false;
 
     // 保存当前路径到历史记录，用于实现返回功能
     if (path != currentPath) {
-        directoryHistory.push(currentPath);  // 将当前路径压入历史栈
+        directoryHistory.push(currentPath);
     }
 
     // 清空当前列表，准备加载新目录内容
-    fileModel->removeRows(0, fileModel->rowCount());  // 清空文件模型
-    listBuffer.clear();  // 清空接收缓冲区
+    fileModel->removeRows(0, fileModel->rowCount());
     
-    // 移除可能存在的\r字符，确保路径格式正确
-    QString cleanPath = path;
-    cleanPath.remove('\r');  // 移除回车符，避免路径问题
-    
-    currentPath = cleanPath;  // 更新当前路径
-    updatePathDisplay();  // 更新路径显示
-    appendLog(QString("浏览目录: %1").arg(cleanPath));  // 记录日志
+    // 更新当前路径
+    currentPath = path;
+    updatePathDisplay();
+    appendLog(QString("浏览目录: %1").arg(path));
 
-    // 构建完整的URL，用于FTP请求
-    QString server = ui->serverEdit->text();  // 获取服务器地址
-    if (!server.startsWith("ftp://")) {
-        server = "ftp://" + server;  // 确保URL以ftp://开头
-    }
-    
-    // 确保server不以/结尾，而path以/开头，避免路径问题
-    if (server.endsWith("/")) {
-        server.chop(1);  // 删除服务器地址末尾的斜杠
-    }
-    
-    // 规范化路径格式
-    QString normalizedPath = cleanPath;
-    if (!normalizedPath.startsWith("/")) {
-        normalizedPath = "/" + normalizedPath;  // 确保路径以/开头
-    }
-    // 确保路径以/结尾，这对于FTP目录浏览很重要
-    if (!normalizedPath.endsWith("/")) {
-        normalizedPath += "/";  // 添加路径末尾的斜杠
-    }
-    
-    // 对URL进行编码处理，特别是处理路径中的非ASCII字符（如中文）和特殊字符
-    QByteArray pathUtf8 = normalizedPath.toUtf8();  // 转换为UTF-8编码
-    char *escapedPath = curl_easy_escape(curl, pathUtf8.constData(), pathUtf8.length());  // URL编码
-    
-    // 替换掉编码后的斜杠，因为我们需要保留路径结构
-    QString encodedPath = QString(escapedPath);
-    encodedPath.replace("%2F", "/"); // 把转义的斜杠替换回来，保留路径结构
-    
-    QString fullUrl = server + encodedPath;  // 构建完整URL
-    appendLog(QString("编码后的目录URL: %1").arg(fullUrl));  // 记录URL
-    
-    // 释放CURL分配的内存，避免内存泄漏
-    curl_free(escapedPath);
-    
-    // 设置CURL选项，准备执行FTP列表请求
-    curl_easy_setopt(curl, CURLOPT_URL, fullUrl.toUtf8().constData());  // 设置URL
-    curl_easy_setopt(curl, CURLOPT_USERNAME, ui->usernameEdit->text().toUtf8().constData());  // 设置用户名
-    curl_easy_setopt(curl, CURLOPT_PASSWORD, ui->passwordEdit->text().toUtf8().constData());  // 设置密码
-    curl_easy_setopt(curl, CURLOPT_PORT, ui->portSpinBox->value());  // 设置端口
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);  // 设置数据接收回调
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, this);  // 设置回调用户数据
-    curl_easy_setopt(curl, CURLOPT_DIRLISTONLY, 0L);  // 获取完整列表，不仅仅是文件名
-
-    // 执行列表命令，获取目录内容
-    CURLcode res = curl_easy_perform(curl);  // 执行CURL请求
-    if (res != CURLE_OK) {
-        // 如果执行失败，记录错误并返回失败
-        appendLog(QString("获取目录列表失败: %1").arg(curl_easy_strerror(res)));
+    // 使用FtpClient列出目录内容
+    QStringList listData = ftpClient->listDirectory(path);
+    if (listData.isEmpty() && !ftpClient->lastError().isEmpty()) {
+        appendLog(QString("获取目录列表失败: %1").arg(ftpClient->lastError()));
         return false;
     }
 
     // 解析目录列表，转换为文件模型数据
-    parseFtpList(listBuffer.join("\n"));  // 合并接收到的数据并解析
+    parseFtpList(listData);
     
     // 添加特殊目录项，便于目录导航
     if (path != "/") {
@@ -377,19 +361,17 @@ bool MainWindow::listDirectory(const QString &path)
                     << new QStandardItem("")
                     << new QStandardItem("Directory")
                     << new QStandardItem("");
-        fileModel->insertRow(0, parentItems);  // 插入到列表最前面
+        fileModel->insertRow(0, parentItems);
     }
     
-    return true;  // 操作成功
+    return true;
 }
 
 /**
  * @brief 解析FTP目录列表
  * @param listData 目录列表数据
- * 
- * 解析FTP服务器返回的目录列表数据，处理多种格式
  */
-void MainWindow::parseFtpList(const QString &listData)
+void MainWindow::parseFtpList(const QStringList &listData)
 {
     // 创建用于匹配不同格式的正则表达式
     // 尝试使用标准的Unix格式解析，如：drwxr-xr-x 2 root root 4096 Jun 12 12:00 dirname
@@ -398,128 +380,142 @@ void MainWindow::parseFtpList(const QString &listData)
     // 尝试匹配Windows FTP服务器格式，如：06-12-23 12:00PM <DIR> dirname
     QRegularExpression windowsRe("(\\d{2}-\\d{2}-\\d{2})\\s+(\\d{2}:\\d{2}[AP]M)\\s+(<DIR>|\\d+)\\s+(.+)");
     
-    // 匹配简单的文件/目录条目，不包含太多信息
+    // 尝试匹配简单的Unix格式，只有权限和文件名
     QRegularExpression simpleRe("([d-])[^\\s]+\\s+.*\\s+(.+)$");
     
-    // 按行分割目录列表数据
-    QStringList lines = listData.split("\n", Qt::SkipEmptyParts);  // 忽略空行
-    appendLog(QString("收到%1行目录数据").arg(lines.count()));  // 记录接收到的数据行数
-    
-    // 调试输出原始数据，便于排查问题
-    if (lines.count() < 50) {  // 只在条目较少时输出，避免刷屏
-        appendLog("原始目录数据:");
-        for (const QString &line : lines) {
-            appendLog("  " + line);  // 输出每一行
-        }
-    }
-    
-    // 逐行解析目录列表数据
-    for (const QString &line : lines) {
+    for (const QString &line : listData) {
+        // 每行数据尝试使用不同的正则表达式解析
+        bool isDir = false;  // 是否为目录
+        QString name;        // 名称
+        QString size = "";   // 大小
+        QString date = "";   // 日期
+        
         // 尝试Unix格式匹配
         QRegularExpressionMatch unixMatch = unixRe.match(line);
         if (unixMatch.hasMatch()) {
-            // 从匹配结果中提取信息
             QString type = unixMatch.captured(1);  // d表示目录，-表示文件
-            QString size = unixMatch.captured(6);  // 文件大小
-            QString date = unixMatch.captured(7);  // 日期和时间
-            QString name = unixMatch.captured(8).trimmed();  // 文件/目录名
-            name.remove('\r');  // 移除可能的回车符
+            isDir = (type == "d");  // 判断是否为目录
             
-            // 创建列表项并添加到模型
-            QList<QStandardItem*> items;
-            items << new QStandardItem(name)  // 名称列
-                  << new QStandardItem(size)  // 大小列
-                  << new QStandardItem(type == "d" ? "Directory" : "File")  // 类型列
-                  << new QStandardItem(date);  // 日期列
+            size = unixMatch.captured(6);  // 文件大小
+            date = unixMatch.captured(7);  // 日期时间
+            name = unixMatch.captured(8);  // 文件名
+            name.remove('\r');  // 移除可能存在的回车符
             
-            fileModel->appendRow(items);  // 添加到文件模型
-            continue;  // 处理下一行
-        }
-        
+            // 跳过当前目录和上级目录的特殊标记
+            if (name == "." || name == "..") continue;
+        } else {
         // 尝试Windows格式匹配
         QRegularExpressionMatch windowsMatch = windowsRe.match(line);
         if (windowsMatch.hasMatch()) {
-            // 从匹配结果中提取信息
-            QString date = windowsMatch.captured(1);  // 日期
-            QString time = windowsMatch.captured(2);  // 时间
-            QString size = windowsMatch.captured(3);  // 大小或<DIR>
-            QString name = windowsMatch.captured(4).trimmed();  // 文件/目录名
-            name.remove('\r');  // 移除可能的回车符
-            
-            bool isDir = size == "<DIR>";  // 判断是否是目录
-            
-            // 创建列表项并添加到模型
-            QList<QStandardItem*> items;
-            items << new QStandardItem(name)  // 名称列
-                  << new QStandardItem(isDir ? "" : size)  // 大小列，目录显示为空
-                  << new QStandardItem(isDir ? "Directory" : "File")  // 类型列
-                  << new QStandardItem(date + " " + time);  // 日期列
-            
-            fileModel->appendRow(items);  // 添加到文件模型
-            continue;  // 处理下一行
-        }
-        
+                QString sizeOrDir = windowsMatch.captured(3);  // <DIR>或者文件大小
+                isDir = (sizeOrDir == "<DIR>");  // 判断是否为目录
+                
+                if (!isDir) size = sizeOrDir;  // 如果不是目录，设置文件大小
+                date = windowsMatch.captured(1) + " " + windowsMatch.captured(2);  // 组合日期和时间
+                name = windowsMatch.captured(4);  // 文件名
+                name.remove('\r');  // 移除可能存在的回车符
+                
+                // 跳过当前目录和上级目录的特殊标记
+                if (name == "." || name == "..") continue;
+            } else {
         // 尝试简单格式匹配
         QRegularExpressionMatch simpleMatch = simpleRe.match(line);
         if (simpleMatch.hasMatch()) {
-            // 从匹配结果中提取信息
             QString type = simpleMatch.captured(1);  // d表示目录，-表示文件
-            QString name = simpleMatch.captured(2).trimmed();  // 文件/目录名
-            name.remove('\r');  // 移除可能的回车符
-            
-            // 创建列表项并添加到模型
-            QList<QStandardItem*> items;
-            items << new QStandardItem(name)  // 名称列
-                  << new QStandardItem("")    // 大小列，无信息
-                  << new QStandardItem(type == "d" ? "Directory" : "File")  // 类型列
-                  << new QStandardItem("");   // 日期列，无信息
-            
-            fileModel->appendRow(items);  // 添加到文件模型
-            continue;  // 处理下一行
+                    isDir = (type == "d");  // 判断是否为目录
+                    name = simpleMatch.captured(2);  // 文件名
+                    name.remove('\r');  // 移除可能存在的回车符
+                    
+                    // 跳过当前目录和上级目录的特殊标记
+                    if (name == "." || name == "..") continue;
+                } else {
+                    // 如果以上格式都无法匹配，尝试按空格分割
+                    QStringList parts = line.split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
+                    if (!parts.isEmpty()) {
+                        // 简单假设最后一部分是文件名
+                        name = parts.last();
+                        name.remove('\r');  // 移除可能存在的回车符
+                        
+                        // 检查名称的第一个字符来判断是否为目录
+                        // 这是一个简单的启发式方法，可能不适用于所有FTP服务器
+                        if (!parts.first().isEmpty() && parts.first()[0] == 'd') {
+                            isDir = true;
+                        }
+                        
+                        // 跳过当前目录和上级目录的特殊标记
+                        if (name == "." || name == "..") continue;
+            } else {
+                        // 无法解析的行，跳过
+                        continue;
+                    }
+                }
+            }
         }
         
-        // 如果以上格式都不匹配，尝试简单的分割
-        QStringList parts = line.split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
-        if (parts.size() >= 1) {
-            // 尝试从分割结果中提取文件名
-            QString name = parts.last().trimmed();  // 取最后一部分作为文件名
-            name.remove('\r');  // 移除可能的回车符
-            QString type = "Unknown";  // 默认类型为未知
-            
-            // 根据文件名判断类型，如果包含点，很可能是文件
-            if (name.contains(".")) {
-                type = "File";  // 设置为文件
-            } else {
-                type = "Directory";  // 设置为目录
-            }
-            
-            // 创建列表项并添加到模型
+        // 创建文件列表项
             QList<QStandardItem*> items;
-            items << new QStandardItem(name)  // 名称列
-                  << new QStandardItem("")    // 大小列，无信息
-                  << new QStandardItem(type)  // 类型列
-                  << new QStandardItem("");   // 日期列，无信息
-            
-            fileModel->appendRow(items);  // 添加到文件模型
+        
+        // 名称列
+        QStandardItem* nameItem = new QStandardItem(name);
+        // 根据是否为目录设置不同的图标
+        if (isDir) {
+            nameItem->setIcon(style()->standardIcon(QStyle::SP_DirIcon));
+        } else {
+            nameItem->setIcon(style()->standardIcon(QStyle::SP_FileIcon));
         }
+        items << nameItem;
+        
+        // 大小列，目录显示为空
+        if (isDir) {
+            items << new QStandardItem("");
+        } else {
+            // 对文件大小进行格式化，使其更易读
+            qint64 sizeVal = size.toLongLong();
+            QString sizeStr;
+            if (sizeVal < 1024) {
+                sizeStr = QString("%1 B").arg(sizeVal);
+            } else if (sizeVal < 1024 * 1024) {
+                sizeStr = QString("%1 KB").arg(sizeVal / 1024.0, 0, 'f', 2);
+            } else if (sizeVal < 1024 * 1024 * 1024) {
+                sizeStr = QString("%1 MB").arg(sizeVal / (1024.0 * 1024.0), 0, 'f', 2);
+            } else {
+                sizeStr = QString("%1 GB").arg(sizeVal / (1024.0 * 1024.0 * 1024.0), 0, 'f', 2);
+            }
+            items << new QStandardItem(sizeStr);
+        }
+        
+        // 类型列
+        items << new QStandardItem(isDir ? "Directory" : "File");
+        
+        // 日期列
+        items << new QStandardItem(date);
+        
+        // 添加到模型
+        fileModel->appendRow(items);
     }
-    
-    // 记录加载的项目数
-    appendLog(QString("已加载 %1 个项目").arg(fileModel->rowCount()));
 }
 
+/**
+ * @brief 添加下载任务
+ * @param remotePath 远程文件/目录路径
+ * @param localPath 本地保存路径
+ * @param isDirectory 是否是目录
+ * @param displayName 显示名称
+ * @param fileSize 文件大小
+ * 
+ * 创建下载任务并添加到下载队列中
+ */
 void MainWindow::addDownloadTask(const QString &remotePath, const QString &localPath, 
                                bool isDirectory, const QString &displayName, qint64 fileSize)
 {
-    QMutexLocker locker(&downloadMutex);
-    
+    // 创建下载任务
     DownloadTask task;
     task.remotePath = remotePath;
     task.localPath = localPath;
     task.isDirectory = isDirectory;
     task.fileSize = fileSize;
     
-    // 如果没有提供显示名称，从路径中提取
+    // 设置显示名称，如果没有提供，则使用路径
     if (displayName.isEmpty()) {
         QFileInfo fileInfo(remotePath);
         task.displayName = fileInfo.fileName();
@@ -527,772 +523,231 @@ void MainWindow::addDownloadTask(const QString &remotePath, const QString &local
         task.displayName = displayName;
     }
     
+    // 添加到下载队列
+    QMutexLocker locker(&downloadMutex);
     downloadQueue.enqueue(task);
     
+    // 记录日志
     appendLog(QString("添加%1任务: %2").arg(isDirectory ? "目录" : "文件").arg(task.displayName));
-}
-
-/**
- * @brief 文件树视图双击事件处理函数
- * @param index 被双击的项目索引
- * 
- * 处理用户在文件列表中双击项目的操作：
- * 1. 如果双击目录，进入该目录
- * 2. 如果双击文件，显示文件信息
- */
-void MainWindow::onFileTreeViewDoubleClicked(const QModelIndex &index)
-{
-    // 检查索引是否有效
-    if (!index.isValid() || index.row() >= fileModel->rowCount()) {
-        return;  // 索引无效，直接返回
-    }
-    
-    // 获取文件/目录名称，并清理可能的特殊字符
-    QString name = fileModel->item(index.row(), 0)->text();
-    name = name.trimmed();  // 去除首尾空白
-    name.remove('\r');  // 移除回车符
-    
-    // 获取类型（文件或目录）
-    QString type = fileModel->item(index.row(), 2)->text();
-
-    // 如果是目录，则导航到该目录
-    if (type == "Directory") {
-        // 构建新路径 - 确保路径格式正确
-        QString newPath;
-        
-        // 特殊处理返回上级目录
-        if (name == "..") {
-            // 如果是".."，获取上级目录路径
-            newPath = getParentDirectory(currentPath);
-        } else if (name == ".") {
-            // 当前目录，不变
-            newPath = currentPath;
-        } else {
-            // 普通目录，拼接路径
-            if (currentPath == "/") {
-                //末尾加上 /
-                newPath = "/" + name + "/";
-            } else {
-                if (currentPath.endsWith("/")) {
-                    newPath = currentPath + name + "/";
-                } else {
-                    newPath = currentPath + "/" + name+ "/";
-                }
-            }
-        }
-        
-        // 确保路径格式正确，以/开头
-        if (!newPath.startsWith("/")) {
-            newPath = "/" + newPath;
-        }
-        
-        // 移除可能存在的\r字符
-        newPath.remove('\r');
-        
-        // 记录日志并导航到新目录
-        appendLog(QString("准备进入目录: %1 (原始名称: '%2')").arg(newPath).arg(name));
-        listDirectory(newPath);  // 列出新目录的内容
-    } else {
-        // 如果是文件，显示文件信息
-        QString size = fileModel->item(index.row(), 1)->text();  // 获取文件大小
-        QString date = fileModel->item(index.row(), 3)->text();  // 获取文件日期
-        appendLog(QString("文件: %1, 大小: %2, 日期: %3").arg(name).arg(size).arg(date));
-    }
-}
-
-/**
- * @brief CURL写入回调函数
- * @param contents 接收到的数据
- * @param size 数据块大小
- * @param nmemb 数据块数量
- * @param userp 用户数据指针（指向MainWindow实例）
- * @return 实际处理的数据大小
- * 
- * 这是libcurl的数据接收回调函数，当服务器返回数据时被调用
- * 主要用于接收目录列表数据，将数据追加到listBuffer
- */
-size_t MainWindow::WriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
-{
-    // 计算实际数据大小（字节数）
-    size_t realsize = size * nmemb;
-    
-    // 将userp转换为MainWindow指针
-    MainWindow *window = static_cast<MainWindow*>(userp);
-    
-    // 将接收到的数据转换为QString并追加到listBuffer
-    QString data = QString::fromUtf8(static_cast<char*>(contents), realsize);
-    window->listBuffer.append(data);
-    
-    // 返回实际处理的数据大小
-    return realsize;
-}
-
-/**
- * @brief 更新按钮状态
- * @param connected 是否已连接到FTP服务器
- * 
- * 根据连接状态启用或禁用界面上的各个按钮
- * 连接时：启用下载、断开连接、导航按钮；禁用连接按钮和连接设置
- * 未连接时：禁用下载、断开连接、导航按钮；启用连接按钮和连接设置
- */
-void MainWindow::updateButtonStates(bool connected)
-{
-    // 更新主要按钮状态
-    ui->connectButton->setEnabled(!connected);    // 连接按钮在已连接时禁用
-    ui->disconnectButton->setEnabled(connected);  // 断开连接按钮在已连接时启用
-    
-    // 更新连接设置控件状态
-    ui->serverEdit->setEnabled(!connected);       // 服务器地址在已连接时禁用
-    ui->usernameEdit->setEnabled(!connected);     // 用户名在已连接时禁用
-    ui->passwordEdit->setEnabled(!connected);     // 密码在已连接时禁用
-    ui->portSpinBox->setEnabled(!connected);      // 端口在已连接时禁用
-    
-    // 更新功能按钮状态
-    ui->downloadButton->setEnabled(connected);    // 下载按钮在已连接时启用
-    
-    // 同步更新导航按钮状态
-    QWidget* backButton = this->findChild<QWidget*>("backButton");
-    QWidget* refreshButton = this->findChild<QWidget*>("refreshButton");
-    
-    // 如果找到这些按钮，更新它们的状态
-    if (backButton) backButton->setEnabled(connected);
-    if (refreshButton) refreshButton->setEnabled(connected);
-}
-
-/**
- * @brief 添加日志信息
- * @param message 日志消息
- * 
- * 在日志文本框中添加一条带时间戳的日志信息
- * 用于记录程序的操作过程和状态变化
- */
-void MainWindow::appendLog(const QString &message)
-{
-    // 在日志文本框中添加带有时间戳的日志信息
-    // 格式为：[时间] 消息内容
-    ui->logTextEdit->appendPlainText(QString("[%1] %2")
-        .arg(QTime::currentTime().toString("hh:mm:ss"))  // 当前时间，格式为小时:分钟:秒
-        .arg(message));  // 消息内容
 }
 
 /**
  * @brief 下载按钮点击事件处理函数
  * 
- * 当用户点击下载按钮时，开始下载选中的文件或目录
- * 对于文件夹，先创建目录结构，再添加文件到下载队列
+ * 下载当前选中的文件或目录到本地指定位置
  */
 void MainWindow::onDownloadButtonClicked()
 {
-    if (!isConnected) {
-        appendLog("请先连接到FTP服务器");  // 未连接时提示用户
+    if (!isConnected) return;
+    
+    // 获取当前选中的项目
+    QModelIndex index = ui->fileTreeView->currentIndex();
+    if (!index.isValid()) {
+        QMessageBox::warning(this, "警告", "请先选择要下载的文件或目录");
         return;
     }
     
-    // 获取选中的项
-    QModelIndex currentIndex = ui->fileTreeView->currentIndex();
-    if (!currentIndex.isValid()) {
-        appendLog("请选择要下载的文件或目录");  // 未选中项时提示用户
+    // 获取选中项的所在行
+    int row = index.row();
+    
+    // 获取名称和类型
+    QString name = fileModel->item(row, 0)->text();
+    QString type = fileModel->item(row, 2)->text();
+    
+    // 如果是特殊目录项，不允许下载
+    if (name == ".." || name == ".") {
+        QMessageBox::warning(this, "警告", "不能下载特殊目录");
         return;
     }
     
-    // 获取选中项的信息（名称、类型、大小）
-    QString name = fileModel->item(currentIndex.row(), 0)->text().trimmed();
-    name.remove('\r');  // 移除回车符
-    QString type = fileModel->item(currentIndex.row(), 2)->text();  // 获取类型（文件或目录）
-    QString size = fileModel->item(currentIndex.row(), 1)->text();  // 获取大小
-    
-    // 特殊目录不能下载
-    if (name == "." || name == "..") {
-        appendLog("不能下载特殊目录");
-        return;
-    }
-    
-    // 构建远程路径（FTP服务器上的完整路径）
+    // 构建远程路径
     QString remotePath;
-    if (currentPath == "/") {
-        remotePath = "/" + name;  // 根目录下直接拼接
+                if (currentPath.endsWith("/")) {
+        remotePath = currentPath + name;
+                } else {
+        remotePath = currentPath + "/" + name;
+    }
+    
+    // 弹出文件对话框，让用户选择保存位置
+    QString saveDir;
+    if (type == "Directory") {
+        // 如果是目录，让用户选择保存的目录
+        saveDir = QFileDialog::getExistingDirectory(this, "选择保存目录", QDir::homePath());
     } else {
-        if (currentPath.endsWith("/")) {
-            remotePath = currentPath + name;  // 已有斜杠，直接拼接
-        } else {
-            remotePath = currentPath + "/" + name;  // 添加斜杠再拼接
+        // 如果是文件，让用户选择保存的文件名
+        saveDir = QFileDialog::getSaveFileName(this, "保存文件", QDir::homePath() + "/" + name);
+    }
+    
+    // 如果用户取消了选择，直接返回
+    if (saveDir.isEmpty()) {
+        return;
+    }
+    
+    // 获取文件大小（如果有）
+    qint64 fileSize = 0;
+    QStandardItem* sizeItem = fileModel->item(row, 1);
+    if (sizeItem) {
+        QString sizeStr = sizeItem->text();
+        // 尝试解析大小字符串，如"1.2 KB"
+        QRegularExpression sizeRe("([\\d\\.]+)\\s*([KMGB]+)?");
+        QRegularExpressionMatch match = sizeRe.match(sizeStr);
+        if (match.hasMatch()) {
+            double size = match.captured(1).toDouble();
+            QString unit = match.captured(2);
+            
+            if (unit == "KB") {
+                fileSize = static_cast<qint64>(size * 1024);
+            } else if (unit == "MB") {
+                fileSize = static_cast<qint64>(size * 1024 * 1024);
+            } else if (unit == "GB") {
+                fileSize = static_cast<qint64>(size * 1024 * 1024 * 1024);
+    } else {
+                fileSize = static_cast<qint64>(size);
+            }
         }
     }
     
-    // 选择本地保存目录，打开文件对话框让用户选择
-    QString defaultDir = QDir::homePath() + "/Downloads";  // 默认下载目录
-    QString targetDir = QFileDialog::getExistingDirectory(this, 
-                                                         "选择保存位置", 
-                                                         defaultDir,
-                                                         QFileDialog::ShowDirsOnly);
-    if (targetDir.isEmpty()) {
-        appendLog("取消下载");  // 用户取消选择，终止下载
-        return;
-    }
-    
-    // 构建本地保存路径
-    QString localPath = targetDir + "/" + name;
-    
-    // 判断下载类型（文件或目录）
+    // 添加下载任务
     bool isDir = (type == "Directory");
     
-    // 确保目录路径以/结尾，这对于FTP目录很重要
+    // 确保目录路径以/结尾
     if (isDir && !remotePath.endsWith("/")) {
         remotePath += "/";
     }
     
-    // 记录下载信息
-    appendLog(QString("准备下载: %1 -> %2").arg(remotePath).arg(localPath));
-    
-    // 创建进度对话框，显示下载进度
-    if (!progressDialog) {
-        progressDialog = new QProgressDialog("准备下载...", "取消", 0, 100, this);
-        progressDialog->setWindowModality(Qt::WindowModal);  // 模态对话框
-        progressDialog->setAutoClose(false);  // 不自动关闭
-        progressDialog->setAutoReset(false);  // 不自动重置
-        
-        // 连接取消按钮的信号，实现取消下载功能
-        connect(progressDialog, &QProgressDialog::canceled, [this]() {
-            appendLog("下载已取消");
-            if (currentDownloadFile) {
-                currentDownloadFile->close();  // 关闭当前下载文件
-                delete currentDownloadFile;    // 释放资源
-                currentDownloadFile = nullptr;
-            }
-            downloadQueue.clear();     // 清空下载队列
-            isDownloading = false;     // 重置下载状态
-            downloadTimer->stop();     // 停止下载定时器
-            progressDialog->close();   // 关闭进度对话框
-        });
-    }
-    
-    // 显示进度对话框
-    progressDialog->setLabelText("准备下载...");
-    progressDialog->setValue(0);
-    progressDialog->show();
-    
-    // 添加下载任务，区分文件和目录
+    // 当下载目录时，在保存路径后添加目录名，确保创建同名文件夹
+    QString localPath = saveDir;
     if (isDir) {
-        // 如果是目录，先创建本地目录结构
-        if (!createLocalDirectory(localPath)) {
-            appendLog(QString("无法创建本地目录: %1").arg(localPath));
-            return;
-        }
-        // 下载整个目录及其内容
-        directoryTaskCount = 0;  // 重置目录任务计数
-        
-        // 修改：这里下载目录不再添加目录任务到队列
-        if (!downloadDirectory(remotePath, localPath)) {
-            appendLog("下载目录结构失败");
-            return;
-        }
+        // 将目标路径设置为: 用户选择的目录 + 远程目录名
+        localPath = QDir::cleanPath(saveDir + "/" + name);
+        appendLog(QString("准备下载目录: %1 -> %2").arg(remotePath).arg(localPath));
     } else {
-        // 如果是文件，直接添加下载任务
-        qint64 fileSize = size.toLongLong();  // 获取文件大小
-        addDownloadTask(remotePath, localPath, false, name, fileSize);  // 添加文件下载任务
+        appendLog(QString("准备下载文件: %1 -> %2").arg(remotePath).arg(localPath));
     }
     
-    // 启动下载队列处理
+    // 添加任务到队列
+    addDownloadTask(remotePath, localPath, isDir, name, fileSize);
+    
+    // 如果当前没有下载任务在进行，启动下载定时器
     if (!isDownloading) {
-        isDownloading = true;  // 标记为正在下载
-        downloadTimer->start(100);  // 每100毫秒处理一次队列，实现异步下载
+        isDownloading = true;
+        downloadTimer->start(100); // 100毫秒后开始处理队列
     }
 }
 
 /**
  * @brief 处理下载队列中的下一个任务
  * 
- * 从下载队列中取出一个文件任务进行处理
- * 由于目录已在开始时创建完成，队列中只包含文件任务
+ * 从下载队列中取出一个任务进行处理
  */
 void MainWindow::processNextDownloadTask()
 {
-    // 如果队列为空，停止下载
+    // 检查队列是否为空
+    QMutexLocker locker(&downloadMutex);
     if (downloadQueue.isEmpty()) {
-        downloadTimer->stop();     // 停止定时器
-        isDownloading = false;     // 重置下载状态
+        // 队列为空，停止定时器，更新状态
+        downloadTimer->stop();
+        isDownloading = false;
         
+        // 如果有进度对话框，关闭它
         if (progressDialog) {
-            progressDialog->setLabelText("下载完成");  // 更新进度对话框
-            progressDialog->setValue(100);             // 进度设为100%
+            progressDialog->close();
+            delete progressDialog;
+            progressDialog = nullptr;
         }
         
-        appendLog("所有下载任务完成");  // 记录完成信息
+        appendLog("所有下载任务已完成");
         return;
     }
     
-    // 获取下一个任务
-    QMutexLocker locker(&downloadMutex);  // 加锁保护队列访问
-    DownloadTask task = downloadQueue.dequeue();  // 取出下一个任务
-    locker.unlock();  // 解锁
+    // 取出队列中的第一个任务
+    DownloadTask task = downloadQueue.dequeue();
+    locker.unlock(); // 解锁互斥锁，允许其他线程访问队列
     
-    // 更新进度对话框显示当前任务
-    if (progressDialog) {
-        progressDialog->setLabelText(QString("正在下载: %1").arg(task.displayName));
+    // 创建或更新进度对话框
+    if (!progressDialog) {
+        progressDialog = new QProgressDialog("正在下载...", "取消", 0, 100, this);
+        progressDialog->setWindowTitle("下载进度");
+        progressDialog->setWindowModality(Qt::WindowModal);
+        progressDialog->setMinimumDuration(0);
+        progressDialog->setCancelButton(nullptr); // 不允许取消
+        progressDialog->setAutoClose(false);
+        progressDialog->show();
     }
     
-    // 直接下载文件（所有任务都是文件任务）
-    downloadFile(task.remotePath, task.localPath);
+    // 设置进度对话框标签
+    progressDialog->setLabelText(QString("正在下载: %1").arg(task.displayName));
+    progressDialog->setValue(0);
+    
+    appendLog(QString("开始下载: %1").arg(task.displayName));
+    
+    // 如果是目录，使用递归方法下载
+    if (task.isDirectory) {
+        // 调用FtpClient下载目录
+        bool success = ftpClient->downloadDirectory(task.remotePath, task.localPath, 
+                                               [this](qint64 bytesReceived, qint64 bytesTotal) {
+                                                   this->updateDownloadProgress(bytesReceived, bytesTotal);
+                                               });
+        
+        if (success) {
+            appendLog(QString("目录下载完成: %1").arg(task.displayName));
+        } else {
+            appendLog(QString("目录下载失败: %1，错误: %2").arg(task.displayName).arg(ftpClient->lastError()));
+        }
+    } else {
+        // 下载文件
+        bool success = ftpClient->downloadFile(task.remotePath, task.localPath, 
+                                          [this](qint64 bytesReceived, qint64 bytesTotal) {
+                                              this->updateDownloadProgress(bytesReceived, bytesTotal);
+                                          });
+        
+        if (success) {
+            appendLog(QString("文件下载完成: %1").arg(task.displayName));
+        } else {
+            appendLog(QString("文件下载失败: %1，错误: %2").arg(task.displayName).arg(ftpClient->lastError()));
+        }
+    }
+    
+    // 处理下一个任务
+    QTimer::singleShot(100, this, &MainWindow::processNextDownloadTask);
 }
 
 /**
- * @brief 更新下载进度显示
+ * @brief 更新下载进度
  * @param bytesReceived 已接收字节数
  * @param bytesTotal 总字节数
- * 
- * 根据下载进度更新进度对话框
  */
 void MainWindow::updateDownloadProgress(qint64 bytesReceived, qint64 bytesTotal)
 {
-    if (!progressDialog) {
-        return;  // 如果进度对话框不存在，直接返回
-    }
+    if (!progressDialog) return;
     
-    // 计算下载百分比
+    // 计算百分比
     int percent = 0;
     if (bytesTotal > 0) {
-        percent = static_cast<int>((bytesReceived * 100) / bytesTotal);  // 计算百分比
+        percent = static_cast<int>((bytesReceived * 100) / bytesTotal);
+        } else {
+        // 如果不知道总大小，根据已接收量显示进度
+        percent = qMin(99, static_cast<int>(bytesReceived / 1024)); // 限制最大为99%
     }
     
-    // 更新进度条显示
+    // 更新进度对话框
     progressDialog->setValue(percent);
-}
-
-/**
- * @brief 创建本地目录
- * @param localPath 要创建的本地目录路径
- * @return 是否创建成功
- * 
- * 创建本地目录，包括多级目录结构
- */
-bool MainWindow::createLocalDirectory(const QString &localPath)
-{
-    QDir dir;
-    if (!dir.exists(localPath)) {
-        // 如果目录不存在，递归创建
-        if (!dir.mkpath(localPath)) {
-            appendLog(QString("创建目录失败: %1").arg(localPath));
-            return false;  // 创建失败
-        }
-        appendLog(QString("创建目录: %1").arg(localPath));  // 记录创建成功
-    }
-    return true;  // 目录已存在或创建成功
-}
-
-/**
- * @brief 下载文件
- * @param remotePath 远程文件路径
- * @param localPath 本地保存路径
- * @return 是否下载成功
- * 
- * 从FTP服务器下载单个文件
- */
-bool MainWindow::downloadFile(const QString &remotePath, const QString &localPath)
-{
-    if (!curl || !isConnected) {
-        appendLog("未连接到FTP服务器");
-        return false;  // 未连接，无法下载
-    }
     
-    appendLog(QString("下载文件: %1 -> %2").arg(remotePath).arg(localPath));
-    
-    // 确保本地目录存在
-    QFileInfo fileInfo(localPath);
-    QDir dir = fileInfo.dir();
-    if (!dir.exists()) {
-        if (!dir.mkpath(".")) {
-            appendLog(QString("无法创建本地目录: %1").arg(dir.path()));
-            return false;
-        }
-    }
-    
-    // 创建并打开本地文件，准备写入数据
-    currentDownloadFile = new QFile(localPath);
-    if (!currentDownloadFile->open(QIODevice::WriteOnly)) {
-        appendLog(QString("无法创建本地文件: %1，错误: %2").arg(localPath).arg(currentDownloadFile->errorString()));
-        delete currentDownloadFile;
-        currentDownloadFile = nullptr;
-        return false;  // 无法创建本地文件
-    }
-    
-    // 重置已接收字节计数
-    totalBytesReceived = 0;
-    
-    // 构建完整的FTP URL
-    QString server = ui->serverEdit->text();
-    if (!server.startsWith("ftp://")) {
-        server = "ftp://" + server;  // 确保URL以ftp://开头
-    }
-    
-    // 确保服务器地址不以斜杠结尾
-    if (server.endsWith("/")) {
-        server.chop(1);  // 删除末尾斜杠
-    }
-    
-    // 确保远程路径以斜杠开头
-    QString normalizedPath = remotePath;
-    if (!normalizedPath.startsWith("/")) {
-        normalizedPath = "/" + normalizedPath;
-    }
-    
-    // 对URL进行编码处理，特别是处理文件名中的非ASCII字符（如中文）和特殊字符
-    QByteArray pathUtf8 = normalizedPath.toUtf8();
-    char *escapedPath = curl_easy_escape(curl, pathUtf8.constData(), pathUtf8.length());
-    
-    // 替换掉编码后的斜杠，因为我们需要保留路径结构
-    QString encodedPath = QString(escapedPath);
-    encodedPath.replace("%2F", "/"); // 把转义的斜杠替换回来，保留路径结构
-    
-    QString fullUrl = server + encodedPath;  // 构建完整URL
-    appendLog(QString("编码后的URL: %1").arg(fullUrl));  // 记录URL
-    
-    // 释放CURL分配的内存
-    curl_free(escapedPath);
-    
-    // 设置CURL选项，准备下载
-    CURL *downloadHandle = curl_easy_init();
-    if (!downloadHandle) {
-        appendLog("无法初始化CURL下载句柄");
-        currentDownloadFile->close();
-        delete currentDownloadFile;
-        currentDownloadFile = nullptr;
-        return false;  // CURL初始化失败
-    }
-    
-    // 配置CURL下载选项
-    curl_easy_setopt(downloadHandle, CURLOPT_URL, fullUrl.toUtf8().constData());  // 设置URL
-    curl_easy_setopt(downloadHandle, CURLOPT_PORT, ui->portSpinBox->value());     // 设置端口
-    curl_easy_setopt(downloadHandle, CURLOPT_USERNAME, ui->usernameEdit->text().toUtf8().constData());  // 设置用户名
-    curl_easy_setopt(downloadHandle, CURLOPT_PASSWORD, ui->passwordEdit->text().toUtf8().constData());  // 设置密码
-    curl_easy_setopt(downloadHandle, CURLOPT_WRITEFUNCTION, DownloadCallback);    // 设置数据接收回调
-    curl_easy_setopt(downloadHandle, CURLOPT_WRITEDATA, this);                    // 设置回调用户数据
-    curl_easy_setopt(downloadHandle, CURLOPT_VERBOSE, 1L);                        // 启用详细输出，便于调试
-    
-    // 执行下载
-    appendLog(QString("开始下载文件: %1").arg(remotePath));
-    CURLcode res = curl_easy_perform(downloadHandle);  // 执行CURL请求
-    
-    // 关闭文件和清理资源
-    currentDownloadFile->close();      // 关闭文件
-    delete currentDownloadFile;        // 释放文件对象
-    currentDownloadFile = nullptr;     // 重置指针
-    
-    // 清理CURL句柄
-    curl_easy_cleanup(downloadHandle);
-    
-    // 处理下载结果
-    if (res != CURLE_OK) {
-        // 下载失败
-        appendLog(QString("下载失败: %1").arg(curl_easy_strerror(res)));
-        return false;
-    }
-    
-    // 下载成功
-    appendLog(QString("下载完成: %1 (总共接收 %2 字节)").arg(localPath).arg(totalBytesReceived));
-    
-    // 处理下一个任务
-    QTimer::singleShot(0, this, &MainWindow::processNextDownloadTask);
-    
-    return true;  // 下载成功
-}
-
-/**
- * @brief 下载文件回调函数
- * @param contents 接收到的数据
- * @param size 数据块大小
- * @param nmemb 数据块数量
- * @param userp 用户数据指针（指向MainWindow实例）
- * @return 实际写入的数据大小
- * 
- * 这是libcurl的下载数据接收回调函数
- * 当下载数据到达时，将数据写入本地文件并更新进度
- */
-size_t MainWindow::DownloadCallback(void *contents, size_t size, size_t nmemb, void *userp)
-{
-    // 将userp转换为MainWindow指针
-    MainWindow *window = static_cast<MainWindow*>(userp);
-    size_t realsize = size * nmemb;  // 计算实际数据大小
-    
-    if (window && window->currentDownloadFile) {
-        // 如果有效，写入文件
-        qint64 written = window->currentDownloadFile->write(static_cast<char*>(contents), realsize);
-        
-        // 更新下载进度
-        window->totalBytesReceived += written;  // 累加已接收字节数
-        
-        // 使用任务的文件大小或已接收大小，而不是currentDownloadFile->size()
-        window->updateDownloadProgress(window->totalBytesReceived, window->totalBytesReceived);
-        
-        return written;  // 返回实际写入的字节数
-    }
-    
-    return 0;  // 无法写入，返回0
-}
-
-/**
- * @brief 下载目录
- * @param remotePath 远程目录路径
- * @param localPath 本地保存路径
- * @return 是否操作成功
- * 
- * 下载整个目录结构，先创建所有文件夹结构，再添加文件到下载队列
- */
-bool MainWindow::downloadDirectory(const QString &remotePath, const QString &localPath)
-{
-    appendLog(QString("下载目录: %1 -> %2").arg(remotePath).arg(localPath));
-    
-    // 不再添加目录任务到队列，而是直接创建本地目录
-    if (!createLocalDirectory(localPath)) {
-        appendLog(QString("无法创建本地目录: %1").arg(localPath));
-        return false;
-    }
-    
-    directoryTaskCount++; // 增加目录计数，用于跟踪递归处理进度
-    
-    // 列出目录内容并创建目录结构、添加文件到下载队列
-    return listDirectoryForDownload(remotePath, localPath);
-}
-
-bool MainWindow::listDirectoryForDownload(const QString &path, const QString &targetDir)
-{
-    if (!curl || !isConnected) return false;
-    
-    // 添加详细日志，显示正在处理的路径
-    appendLog(QString("处理目录内容: %1 -> %2").arg(path).arg(targetDir));
-    
-    // 清空列表缓冲区
-    listBuffer.clear();
-    
-    // 构建完整的URL
-    QString server = ui->serverEdit->text();
-    if (!server.startsWith("ftp://")) {
-        server = "ftp://" + server;
-    }
-    
-    // 确保server不以/结尾，而path以/开头
-    if (server.endsWith("/")) {
-        server.chop(1);
-    }
-    
-    QString normalizedPath = path;
-    if (!normalizedPath.startsWith("/")) {
-        normalizedPath = "/" + normalizedPath;
-    }
-    
-    // 确保路径以/结尾，这对于FTP目录浏览很重要
-    if (!normalizedPath.endsWith("/")) {
-        normalizedPath += "/";
-    }
-    
-    // 对URL进行编码处理，特别是处理路径中的非ASCII字符（如中文）和特殊字符
-    QByteArray pathUtf8 = normalizedPath.toUtf8();
-    char *escapedPath = curl_easy_escape(curl, pathUtf8.constData(), pathUtf8.length());
-    
-    // 替换掉编码后的斜杠，因为我们需要保留路径结构
-    QString encodedPath = QString(escapedPath);
-    encodedPath.replace("%2F", "/"); // 把转义的斜杠替换回来，保留路径结构
-    
-    QString fullUrl = server + encodedPath;
-    appendLog(QString("编码后的目录URL: %1").arg(fullUrl));
-    
-    // 释放CURL分配的内存
-    curl_free(escapedPath);
-    
-    // 设置CURL选项
-    CURL *listHandle = curl_easy_init();
-    if (!listHandle) {
-        appendLog("无法初始化CURL列表句柄");
-        return false;
-    }
-    
-    curl_easy_setopt(listHandle, CURLOPT_URL, fullUrl.toUtf8().constData());
-    curl_easy_setopt(listHandle, CURLOPT_USERNAME, ui->usernameEdit->text().toUtf8().constData());
-    curl_easy_setopt(listHandle, CURLOPT_PASSWORD, ui->passwordEdit->text().toUtf8().constData());
-    curl_easy_setopt(listHandle, CURLOPT_PORT, ui->portSpinBox->value());
-    curl_easy_setopt(listHandle, CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(listHandle, CURLOPT_WRITEDATA, this);
-    curl_easy_setopt(listHandle, CURLOPT_DIRLISTONLY, 0L); // 获取详细列表
-    
-    // 执行列表命令
-    CURLcode res = curl_easy_perform(listHandle);
-    
-    // 清理CURL句柄
-    curl_easy_cleanup(listHandle);
-    
-    if (res != CURLE_OK) {
-        appendLog(QString("获取目录列表失败: %1").arg(curl_easy_strerror(res)));
-        return false;
-    }
-    
-    // 显示获取到的原始数据长度，用于调试
-    QString listData = listBuffer.join("\n");
-    appendLog(QString("获取到目录数据长度: %1 字节").arg(listData.length()));
-    
-    QStringList lines = listData.split("\n", Qt::SkipEmptyParts);
-    appendLog(QString("解析到 %1 行内容").arg(lines.count()));
-    
-    // 使用与parseFtpList相似的正则表达式解析文件列表
-    QRegularExpression unixRe("([d-])([rwx-]{9})\\s+(\\d+)\\s+(\\w+)\\s+(\\w+)\\s+(\\d+)\\s+(\\w+\\s+\\d+\\s+[\\d:]+)\\s+(.+)");
-    QRegularExpression windowsRe("(\\d{2}-\\d{2}-\\d{2})\\s+(\\d{2}:\\d{2}[AP]M)\\s+(<DIR>|\\d+)\\s+(.+)");
-    QRegularExpression simpleRe("([d-])[^\\s]+\\s+.*\\s+(.+)$");
-    
-    // 存储该目录中的所有子目录和文件信息
-    QList<QString> subDirs;
-    QList<QPair<QString, qint64>> files;
-    
-    // 收集目录和文件的计数，用于调试
-    int dirCount = 0;
-    int fileCount = 0;
-    
-    for (const QString &line : lines) {
-        bool isDir = false;
-        QString name;
-        qint64 fileSize = 0;
-        
-        // 尝试Unix格式匹配
-        QRegularExpressionMatch unixMatch = unixRe.match(line);
-        if (unixMatch.hasMatch()) {
-            QString type = unixMatch.captured(1);
-            fileSize = unixMatch.captured(6).toLongLong();
-            name = unixMatch.captured(8).trimmed();
-            name.remove('\r');
-            isDir = (type == "d");
-            
-            // 跳过特殊目录
-            if (name == "." || name == "..") {
-                continue;
-            }
-        } else {
-            // 尝试Windows格式匹配
-            QRegularExpressionMatch windowsMatch = windowsRe.match(line);
-            if (windowsMatch.hasMatch()) {
-                QString size = windowsMatch.captured(3);
-                name = windowsMatch.captured(4).trimmed();
-                name.remove('\r');
-                isDir = (size == "<DIR>");
-                
-                if (!isDir) {
-                    fileSize = size.toLongLong();
-                }
-                
-                // 跳过特殊目录
-                if (name == "." || name == "..") {
-                    continue;
-                }
-            } else {
-                // 尝试简单格式匹配
-                QRegularExpressionMatch simpleMatch = simpleRe.match(line);
-                if (simpleMatch.hasMatch()) {
-                    QString type = simpleMatch.captured(1);
-                    name = simpleMatch.captured(2).trimmed();
-                    name.remove('\r');
-                    isDir = (type == "d");
-                    
-                    // 跳过特殊目录
-                    if (name == "." || name == "..") {
-                        continue;
-                    }
+    // 更新大小标签
+    QString sizeText;
+    if (bytesReceived < 1024) {
+        sizeText = QString("%1 / %2 B").arg(bytesReceived).arg(bytesTotal > 0 ? QString::number(bytesTotal) : "?");
+    } else if (bytesReceived < 1024 * 1024) {
+        sizeText = QString("%1 / %2 KB").arg(bytesReceived / 1024.0, 0, 'f', 2)
+                        .arg(bytesTotal > 0 ? QString::number(bytesTotal / 1024.0, 'f', 2) : "?");
+    } else if (bytesReceived < 1024 * 1024 * 1024) {
+        sizeText = QString("%1 / %2 MB").arg(bytesReceived / (1024.0 * 1024.0), 0, 'f', 2)
+                        .arg(bytesTotal > 0 ? QString::number(bytesTotal / (1024.0 * 1024.0), 'f', 2) : "?");
                 } else {
-                    // 如果以上格式都不匹配，尝试简单的分割
-                    QStringList parts = line.split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
-                    if (parts.size() >= 1) {
-                        name = parts.last().trimmed();
-                        name.remove('\r');
-                        
-                        // 如果文件名中包含点，可能是文件，否则可能是目录
-                        isDir = !name.contains(".");
-                        
-                        // 跳过特殊目录
-                        if (name == "." || name == "..") {
-                            continue;
-                        }
-                    } else {
-                        continue; // 无法解析的行
-                    }
-                }
-            }
-        }
-        
-        // 跳过空名称
-        if (name.isEmpty()) {
-            continue;
-        }
-        
-        // 构建远程路径和本地路径
-        QString itemRemotePath = normalizedPath + name;
-        if (isDir && !itemRemotePath.endsWith("/")) {
-            itemRemotePath += "/";
-        }
-        
-        QString itemLocalPath = targetDir + "/" + name;
-        
-        if (isDir) {
-            // 不添加目录任务，而是收集子目录信息，稍后处理
-            // 使用特殊分隔符 "||" 代替 ":" 来避免与路径中的冒号冲突
-            subDirs.append(itemRemotePath + "||" + itemLocalPath);
-            dirCount++;
-            // 添加日志显示找到的目录
-            appendLog(QString("发现子目录: %1").arg(name));
-        } else {
-            // 收集文件信息，稍后添加到下载队列
-            // 使用特殊分隔符 "||" 代替 ":" 来避免与路径中的冒号冲突
-            files.append(qMakePair(itemRemotePath + "||" + itemLocalPath + "||" + name, fileSize));
-            fileCount++;
-            // 添加日志显示找到的文件
-            appendLog(QString("发现文件: %1 (大小: %2 字节)").arg(name).arg(fileSize));
-        }
+        sizeText = QString("%1 / %2 GB").arg(bytesReceived / (1024.0 * 1024.0 * 1024.0), 0, 'f', 2)
+                        .arg(bytesTotal > 0 ? QString::number(bytesTotal / (1024.0 * 1024.0 * 1024.0), 'f', 2) : "?");
     }
     
-    // 添加统计信息日志
-    appendLog(QString("目录 %1 中: 发现 %2 个子目录, %3 个文件").arg(path).arg(dirCount).arg(fileCount));
-    
-    // 先处理所有子目录，创建完整的目录结构
-    for (const QString &dirInfo : subDirs) {
-        QStringList parts = dirInfo.split("||");
-        if (parts.size() < 2) {
-            appendLog(QString("错误的目录信息格式: %1").arg(dirInfo));
-            continue;
-        }
-        
-        QString remoteSubDir = parts[0];
-        QString localSubDir = parts[1];
-        
-        // 创建本地子目录
-        createLocalDirectory(localSubDir);
-        
-        // 递归处理子目录，继续创建结构
-        directoryTaskCount++; // 增加目录计数
-        listDirectoryForDownload(remoteSubDir, localSubDir);
-    }
-    
-    // 处理完所有子目录后，再添加文件到下载队列
-    int addedFiles = 0;
-    for (const QPair<QString, qint64> &fileInfo : files) {
-        QStringList parts = fileInfo.first.split("||");
-        if (parts.size() < 3) {
-            appendLog(QString("错误的文件信息格式: %1").arg(fileInfo.first));
-            continue;
-        }
-        
-        QString remoteFilePath = parts[0];
-        QString localFilePath = parts[1];
-        QString displayName = parts[2];
-        qint64 fileSize = fileInfo.second;
-        
-        // 添加日志显示添加的文件任务
-        appendLog(QString("添加文件下载任务: %1 -> %2 (大小: %3 字节)").arg(remoteFilePath).arg(localFilePath).arg(fileSize));
-        
-        // 添加文件下载任务
-        addDownloadTask(remoteFilePath, localFilePath, false, displayName, fileSize);
-        addedFiles++;
-    }
-    
-    // 添加文件统计日志
-    appendLog(QString("已添加 %1 个文件到下载队列").arg(addedFiles));
-    
-    // 减少目录计数
-    directoryTaskCount--;
-    appendLog(QString("剩余目录任务: %1").arg(directoryTaskCount));
-    
-    return true;
+    progressDialog->setLabelText(QString("正在下载: %1\n%2").arg(
+        downloadQueue.isEmpty() ? "" : downloadQueue.head().displayName).arg(sizeText));
 }
