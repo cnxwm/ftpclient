@@ -278,10 +278,12 @@ bool FtpClient::downloadFile(const QString &remotePath, const QString &localPath
  * @param remotePath 远程目录路径
  * @param localPath 本地保存路径
  * @param progressCallback 进度回调函数
+ * @param taskQueue 下载任务队列，用于存储待下载的文件任务
  * @return 下载是否成功
  */
 bool FtpClient::downloadDirectory(const QString &remotePath, const QString &localPath,
-                                 std::function<void(qint64, qint64)> progressCallback)
+                                 std::function<void(qint64, qint64)> progressCallback,
+                                 QQueue<DownloadTask> *taskQueue)
 {
     // 创建本地目录
     if (!createLocalDirectory(localPath)) {
@@ -290,7 +292,7 @@ bool FtpClient::downloadDirectory(const QString &remotePath, const QString &loca
     }
     
     // 列出目录内容并创建目录结构、添加文件到下载队列
-    return listDirectoryForDownload(remotePath, localPath, progressCallback);
+    return listDirectoryForDownload(remotePath, localPath, progressCallback, taskQueue);
 }
 
 /**
@@ -298,10 +300,12 @@ bool FtpClient::downloadDirectory(const QString &remotePath, const QString &loca
  * @param path 要列出的目录路径
  * @param targetDir 本地目标目录
  * @param progressCallback 进度回调函数
+ * @param taskQueue 下载任务队列，用于存储待下载的文件任务
  * @return 操作是否成功
  */
 bool FtpClient::listDirectoryForDownload(const QString &path, const QString &targetDir,
-                                        std::function<void(qint64, qint64)> progressCallback)
+                                        std::function<void(qint64, qint64)> progressCallback,
+                                        QQueue<DownloadTask> *taskQueue)
 {
     if (!m_curl || !m_isConnected) {
         m_lastError = "未连接到FTP服务器";
@@ -385,6 +389,7 @@ bool FtpClient::listDirectoryForDownload(const QString &path, const QString &tar
     for (const QString &line : lines) {
         bool isDir = false;
         QString name;
+        qint64 fileSize = 0;
         
         // 尝试Unix格式匹配
         QRegularExpressionMatch unixMatch = unixRe.match(line);
@@ -393,6 +398,11 @@ bool FtpClient::listDirectoryForDownload(const QString &path, const QString &tar
             name = unixMatch.captured(8).trimmed();
             name.remove('\r');
             isDir = (type == "d");
+            
+            // 尝试获取文件大小
+            if (!isDir) {
+                fileSize = unixMatch.captured(6).toLongLong();
+            }
             
             // 跳过特殊目录
             if (name == "." || name == "..") {
@@ -406,6 +416,11 @@ bool FtpClient::listDirectoryForDownload(const QString &path, const QString &tar
                 name = windowsMatch.captured(4).trimmed();
                 name.remove('\r');
                 isDir = (size == "<DIR>");
+                
+                // 尝试获取文件大小
+                if (!isDir) {
+                    fileSize = size.toLongLong();
+                }
                 
                 // 跳过特殊目录
                 if (name == "." || name == "..") {
@@ -449,7 +464,7 @@ bool FtpClient::listDirectoryForDownload(const QString &path, const QString &tar
         
         // 处理找到的项目
         if (isDir) {
-            // 如果是目录，递归下载
+            // 如果是目录，先创建本地目录，然后递归处理
             QString newRemotePath = normalizedPath + name;
             QString newLocalPath = targetDir + "/" + name;
             
@@ -459,14 +474,29 @@ bool FtpClient::listDirectoryForDownload(const QString &path, const QString &tar
                 continue;
             }
             
-            success = listDirectoryForDownload(newRemotePath, newLocalPath, progressCallback) && success;
+            // 递归处理子目录，继续使用相同的任务队列
+            success = listDirectoryForDownload(newRemotePath, newLocalPath, progressCallback, taskQueue) && success;
         } else {
-            // 如果是文件，添加到下载队列
-            QString remoteFilePath = normalizedPath + name;
-            QString localFilePath = targetDir + "/" + name;
-            
-            if (!downloadFile(remoteFilePath, localFilePath, progressCallback)) {
-                success = false;
+            // 如果是文件，添加到任务队列而不是直接下载
+            if (taskQueue) {
+                // 创建下载任务并添加到队列
+                DownloadTask task;
+                task.remotePath = normalizedPath + name;
+                task.localPath = targetDir + "/" + name;
+                task.isDirectory = false;
+                task.fileSize = fileSize;
+                task.displayName = name;
+                
+                // 将任务添加到队列
+                taskQueue->enqueue(task);
+            } else {
+                // 如果没有提供队列，则使用传统方式直接下载
+                QString remoteFilePath = normalizedPath + name;
+                QString localFilePath = targetDir + "/" + name;
+                
+                if (!downloadFile(remoteFilePath, localFilePath, progressCallback)) {
+                    success = false;
+                }
             }
         }
     }

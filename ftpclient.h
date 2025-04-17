@@ -94,11 +94,13 @@ public:
      * @brief 下载目录
      * @param remotePath 远程目录路径
      * @param localPath 本地保存路径
-     * @param progressCallback 进度回调函数(可选)
+     * @param progressCallback 进度回调函数
+     * @param taskQueue 下载任务队列，用于存储待下载的文件任务
      * @return 下载是否成功
      */
     bool downloadDirectory(const QString &remotePath, const QString &localPath,
-                          std::function<void(qint64, qint64)> progressCallback = nullptr);
+                          std::function<void(qint64, qint64)> progressCallback = nullptr,
+                          QQueue<DownloadTask> *taskQueue = nullptr);
     
     /**
      * @brief 获取当前连接状态
@@ -124,10 +126,13 @@ private:
      * @brief 列出目录内容用于下载
      * @param path 要列出的目录路径
      * @param targetDir 本地目标目录
+     * @param progressCallback 进度回调函数
+     * @param taskQueue 下载任务队列，用于存储待下载的文件任务
      * @return 操作是否成功
      */
     bool listDirectoryForDownload(const QString &path, const QString &targetDir,
-                                 std::function<void(qint64, qint64)> progressCallback = nullptr);
+                                 std::function<void(qint64, qint64)> progressCallback = nullptr,
+                                 QQueue<DownloadTask> *taskQueue = nullptr);
     
     /**
      * @brief 创建本地目录

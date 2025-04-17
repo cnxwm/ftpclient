@@ -562,9 +562,9 @@ void MainWindow::onDownloadButtonClicked()
     
     // 构建远程路径
     QString remotePath;
-                if (currentPath.endsWith("/")) {
+    if (currentPath.endsWith("/")) {
         remotePath = currentPath + name;
-                } else {
+    } else {
         remotePath = currentPath + "/" + name;
     }
     
@@ -601,16 +601,14 @@ void MainWindow::onDownloadButtonClicked()
                 fileSize = static_cast<qint64>(size * 1024 * 1024);
             } else if (unit == "GB") {
                 fileSize = static_cast<qint64>(size * 1024 * 1024 * 1024);
-    } else {
+            } else {
                 fileSize = static_cast<qint64>(size);
             }
         }
     }
     
-    // 添加下载任务
-    bool isDir = (type == "Directory");
-    
     // 确保目录路径以/结尾
+    bool isDir = (type == "Directory");
     if (isDir && !remotePath.endsWith("/")) {
         remotePath += "/";
     }
@@ -621,12 +619,29 @@ void MainWindow::onDownloadButtonClicked()
         // 将目标路径设置为: 用户选择的目录 + 远程目录名
         localPath = QDir::cleanPath(saveDir + "/" + name);
         appendLog(QString("准备下载目录: %1 -> %2").arg(remotePath).arg(localPath));
+        
+        // 清空下载队列
+        QMutexLocker locker(&downloadMutex);
+        downloadQueue.clear();
+        locker.unlock();
+        
+        // 先处理目录结构，将文件放入队列
+        bool success = ftpClient->downloadDirectory(remotePath, localPath, 
+                                                 [this](qint64 bytesReceived, qint64 bytesTotal) {
+                                                     this->updateDownloadProgress(bytesReceived, bytesTotal);
+                                                 }, &downloadQueue);
+        
+        if (!success) {
+            appendLog(QString("创建目录结构失败: %1，错误: %2").arg(name).arg(ftpClient->lastError()));
+            return;
+        }
+        
+        appendLog(QString("目录结构创建完成，找到 %1 个文件需要下载").arg(downloadQueue.size()));
     } else {
+        // 如果是单个文件，直接添加到下载队列
         appendLog(QString("准备下载文件: %1 -> %2").arg(remotePath).arg(localPath));
+        addDownloadTask(remotePath, localPath, isDir, name, fileSize);
     }
-    
-    // 添加任务到队列
-    addDownloadTask(remotePath, localPath, isDir, name, fileSize);
     
     // 如果当前没有下载任务在进行，启动下载定时器
     if (!isDownloading) {
@@ -681,19 +696,10 @@ void MainWindow::processNextDownloadTask()
     
     appendLog(QString("开始下载: %1").arg(task.displayName));
     
-    // 如果是目录，使用递归方法下载
+    // 如果是目录，只需创建目录（因为文件已经在队列中）
     if (task.isDirectory) {
-        // 调用FtpClient下载目录
-        bool success = ftpClient->downloadDirectory(task.remotePath, task.localPath, 
-                                               [this](qint64 bytesReceived, qint64 bytesTotal) {
-                                                   this->updateDownloadProgress(bytesReceived, bytesTotal);
-                                               });
-        
-        if (success) {
-            appendLog(QString("目录下载完成: %1").arg(task.displayName));
-        } else {
-            appendLog(QString("目录下载失败: %1，错误: %2").arg(task.displayName).arg(ftpClient->lastError()));
-        }
+        // 目录应该已经创建好了，所以不需要做额外处理
+        appendLog(QString("目录创建完成: %1").arg(task.displayName));
     } else {
         // 下载文件
         bool success = ftpClient->downloadFile(task.remotePath, task.localPath, 
